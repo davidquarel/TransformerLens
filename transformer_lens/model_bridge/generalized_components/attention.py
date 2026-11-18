@@ -874,11 +874,26 @@ class AttentionBridge(GeneralizedComponent):
         if reroute_position_bias:
             kwargs["output_attentions"] = True
             capture_handles = self._capture_qk_outputs(qk_capture)
+        # An observed call on an SDPA-loaded model runs HF's eager kernel so the weights exist.
+        hf_config: Any = getattr(self.original_component, "config", None)
+        eager_fallback = (
+            getattr(self.config, "attn_implementation", None) == "sdpa"
+            and getattr(hf_config, "_attn_implementation", None) == "sdpa"
+            and not self._use_sdpa()
+        )
+        if eager_fallback:
+            hf_config._attn_implementation = "eager"
+            if "attention_mask" in kwargs:
+                kwargs["attention_mask"] = self._sdpa_mask_to_eager(
+                    kwargs["attention_mask"], kwargs.get("hidden_states", args[0] if args else None)
+                )
         # try/finally so the captured tensor (and its autograd graph) is
         # released even if original_component raises.
         try:
             output = self.original_component(*args, **kwargs)
         finally:
+            if eager_fallback:
+                hf_config._attn_implementation = "sdpa"
             self._captured_pre_ln_residual = None
             for handle in capture_handles:
                 handle.remove()
@@ -911,6 +926,26 @@ class AttentionBridge(GeneralizedComponent):
         else:
             output = self.hook_out(output)
         return output
+
+    def _use_sdpa(self) -> bool:
+        """SDPA was requested at boot and no hook observes the scores or pattern."""
+        return getattr(self.config, "attn_implementation", None) == "sdpa" and not any(
+            hook._forward_hooks or hook._forward_pre_hooks or hook._backward_hooks
+            for hook in (self.hook_attn_scores, self.hook_pattern)
+        )
+
+    def _sdpa_mask_to_eager(self, mask: Any, hidden_states: Any) -> Any:
+        """SDPA masks are boolean, or None for plain causal; eager adds a float mask."""
+        if not isinstance(hidden_states, torch.Tensor):
+            return mask
+        q_len = hidden_states.shape[-2]
+        if mask is None and q_len > 1 and getattr(self.original_component, "is_causal", True):
+            mask = torch.ones(q_len, q_len, dtype=torch.bool, device=hidden_states.device)
+            mask = mask.tril()[None, None]
+        if isinstance(mask, torch.Tensor) and mask.dtype == torch.bool:
+            dtype = hidden_states.dtype
+            mask = torch.where(mask, 0.0, torch.finfo(dtype).min).to(dtype)
+        return mask
 
     def _capture_qk_outputs(self, store: Dict[str, torch.Tensor]) -> list:
         """Capture the Q/K projection outputs during the wrapped module's forward.

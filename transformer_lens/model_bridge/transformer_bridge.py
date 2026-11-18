@@ -284,6 +284,7 @@ class TransformerBridge(BridgeCore, HookIntrospectionMixin, nn.Module):
             n_devices: Optional[int] = None,
             max_memory: Optional[dict[Union[str, int], Union[str, int]]] = None,
             offload_folder: Optional[str] = None,
+            attn_implementation: Optional[str] = None,
         ) -> "TransformerBridge":
             ...
 

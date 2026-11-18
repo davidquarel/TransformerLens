@@ -115,6 +115,7 @@ def boot(
     n_devices: int | None = None,
     max_memory: dict[str | int, str | int] | None = None,
     offload_folder: str | None = None,
+    attn_implementation: str | None = None,
 ) -> TransformerBridge:
     """Boot a model from HuggingFace (exposed as ``TransformerBridge.boot_transformers``).
 
@@ -189,6 +190,9 @@ def boot(
             conventions (``step{value}`` for Pythia, ``checkpoint-{value}`` for stanford-crfm).
         checkpoint_value: Training step or token count of the desired checkpoint. Alternative to
             ``checkpoint_index``; must be one of the labels returned by ``get_checkpoint_labels``.
+        attn_implementation: ``"sdpa"`` runs attention with SDPA on calls where no hook observes
+            ``hook_attn_scores`` / ``hook_pattern``; observed calls fall back to eager.
+            Defaults to eager.
 
     Returns:
         The bridge to the loaded model.
@@ -219,6 +223,7 @@ def boot(
                 "n_devices": n_devices,
                 "max_memory": max_memory,
                 "offload_folder": offload_folder,
+                "attn_implementation": attn_implementation,
             },
         )
     if checkpoint_index is not None or checkpoint_value is not None:
@@ -311,6 +316,12 @@ def boot(
     adapter = architecture_adapter_factory.ArchitectureAdapterFactory.select_architecture_adapter(
         bridge_config
     )
+    if attn_implementation is not None:
+        if attn_implementation not in ("eager", "sdpa"):
+            raise ValueError(
+                f"attn_implementation must be 'eager' or 'sdpa', got {attn_implementation!r}."
+            )
+        adapter.cfg.attn_implementation = attn_implementation
     # Pre-loaded models carry their own weight placement (possibly set by the caller via
     # device_map). Passing device_map / n_devices / max_memory alongside hf_model= is ambiguous
     # and would silently be ignored, so fail loudly.
@@ -401,6 +412,8 @@ def boot(
         # never fire. An explicit adapter/user choice wins, matching the load path above.
         if getattr(adapter.cfg, "attn_implementation", None) is None:
             force_eager_attention(hf_model)
+        elif attn_implementation == "sdpa":
+            hf_model.set_attn_implementation("sdpa")
         # Only an explicit dtype casts; the default means "as loaded". The helper skips
         # quantized models, whose dtype is the quantizer's to choose. Cast before moving,
         # so a narrower dtype is what reaches the device.

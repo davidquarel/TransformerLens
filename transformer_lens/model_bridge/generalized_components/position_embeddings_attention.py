@@ -534,77 +534,103 @@ class PositionEmbeddingsAttentionBridge(PositionEmbeddingHooksMixin, AttentionBr
         # --- KV cache: extend K/V with cached positions ---
         key_states, value_states = self._update_kv_cache(key_states, value_states, **kwargs)
 
-        # --- GQA: Expand K/V ---
-        num_key_value_groups = getattr(hf_attn, "num_key_value_groups", 1)
-        if num_key_value_groups > 1:
-            from transformers.models.llama.modeling_llama import repeat_kv
+        q_len, kv_len = query_states.shape[-2], key_states.shape[-2]
+        # Softcap and sinks have no SDPA kernel; a None mask must be plain causal or decode.
+        if (
+            getattr(hf_attn, "attn_logit_softcapping", None) is None
+            and getattr(hf_attn, "sinks", None) is None
+            and (attention_mask.ndim == 4 if attention_mask is not None else q_len in (1, kv_len))
+            and self._use_sdpa()
+        ):
+            from transformers.integrations.sdpa_attention import sdpa_attention_forward
 
-            key_states_expanded = repeat_kv(key_states, num_key_value_groups)
-            value_states_expanded = repeat_kv(value_states, num_key_value_groups)
-        else:
-            key_states_expanded = key_states
-            value_states_expanded = value_states
-
-        # --- Attention Scores ---
-        scaling = getattr(hf_attn, "scaling", head_dim**-0.5)
-        attn_scores = torch.matmul(query_states, key_states_expanded.transpose(-2, -1)) * scaling
-
-        # --- Softcapping (Gemma 2) ---
-        softcap = getattr(hf_attn, "attn_logit_softcapping", None)
-        if softcap is not None:
-            attn_scores = attn_scores / softcap
-            attn_scores = torch.tanh(attn_scores)
-            attn_scores = attn_scores * softcap
-
-        # --- Causal / Sliding Window Mask ---
-        kv_seq_len = key_states_expanded.shape[-2]
-        q_seq_len = query_states.shape[-2]
-        attn_scores = self._apply_reconstruct_attention_mask(
-            attn_scores=attn_scores,
-            attention_mask=attention_mask,
-            seq_len=kv_seq_len,
-            q_seq_len=q_seq_len,
-        )
-
-        # --- hook_attn_scores: PRE-softmax (matching HookedTransformer) ---
-        attn_scores = self.hook_attn_scores(attn_scores)
-
-        # --- Softmax (in float32 for numerical stability) ---
-        # GPT-OSS attention sinks: a learned per-head logit joins the softmax as
-        # an extra key column and is dropped afterward, so every real position's
-        # weight is scaled down by the sink's share. Appended after
-        # hook_attn_scores so hooks keep the [batch, head, q_pos, kv_pos] shape
-        # and score patches still flow into the softmax.
-        sinks = getattr(hf_attn, "sinks", None)
-        if sinks is not None:
-            sink_col = (
-                sinks.reshape(1, -1, 1, 1)
-                .expand(attn_scores.shape[0], -1, attn_scores.shape[-2], -1)
-                .to(attn_scores.dtype)
+            attn_output, attn_weights = sdpa_attention_forward(
+                hf_attn,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=getattr(hf_attn, "attention_dropout", 0.0) if self.training else 0.0,
+                scaling=getattr(hf_attn, "scaling", head_dim**-0.5),
+                is_causal=self.is_causal and not self.is_cross_attention,
             )
-            combined = torch.cat([attn_scores, sink_col], dim=-1)
-            combined = combined - combined.max(dim=-1, keepdim=True).values
-            attn_weights = torch.nn.functional.softmax(combined, dim=-1, dtype=torch.float32).to(
-                query_states.dtype
-            )[..., :-1]
+            attn_output = attn_output.reshape(*input_shape, -1)
         else:
-            attn_weights = self._masked_softmax(attn_scores, dtype=torch.float32).to(
-                query_states.dtype
+            # --- GQA: Expand K/V ---
+            num_key_value_groups = getattr(hf_attn, "num_key_value_groups", 1)
+            if num_key_value_groups > 1:
+                from transformers.models.llama.modeling_llama import repeat_kv
+
+                key_states_expanded = repeat_kv(key_states, num_key_value_groups)
+                value_states_expanded = repeat_kv(value_states, num_key_value_groups)
+            else:
+                key_states_expanded = key_states
+                value_states_expanded = value_states
+
+            # --- Attention Scores ---
+            scaling = getattr(hf_attn, "scaling", head_dim**-0.5)
+            attn_scores = (
+                torch.matmul(query_states, key_states_expanded.transpose(-2, -1)) * scaling
             )
-        attn_weights = self._scrub_compatibility_pattern_nans(attn_weights)
 
-        # --- Dropout ---
-        dropout_rate = getattr(hf_attn, "attention_dropout", 0.0)
-        if self.training and dropout_rate > 0.0:
-            attn_weights = torch.nn.functional.dropout(attn_weights, p=dropout_rate, training=True)
+            # --- Softcapping (Gemma 2) ---
+            softcap = getattr(hf_attn, "attn_logit_softcapping", None)
+            if softcap is not None:
+                attn_scores = attn_scores / softcap
+                attn_scores = torch.tanh(attn_scores)
+                attn_scores = attn_scores * softcap
 
-        # --- hook_pattern: POST-softmax ---
-        attn_weights = self.hook_pattern(attn_weights)
+            # --- Causal / Sliding Window Mask ---
+            kv_seq_len = key_states_expanded.shape[-2]
+            q_seq_len = query_states.shape[-2]
+            attn_scores = self._apply_reconstruct_attention_mask(
+                attn_scores=attn_scores,
+                attention_mask=attention_mask,
+                seq_len=kv_seq_len,
+                q_seq_len=q_seq_len,
+            )
 
-        # --- Attention Output ---
-        attn_output = torch.matmul(attn_weights, value_states_expanded)
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(*input_shape, -1)
+            # --- hook_attn_scores: PRE-softmax (matching HookedTransformer) ---
+            attn_scores = self.hook_attn_scores(attn_scores)
+
+            # --- Softmax (in float32 for numerical stability) ---
+            # GPT-OSS attention sinks: a learned per-head logit joins the softmax as
+            # an extra key column and is dropped afterward, so every real position's
+            # weight is scaled down by the sink's share. Appended after
+            # hook_attn_scores so hooks keep the [batch, head, q_pos, kv_pos] shape
+            # and score patches still flow into the softmax.
+            sinks = getattr(hf_attn, "sinks", None)
+            if sinks is not None:
+                sink_col = (
+                    sinks.reshape(1, -1, 1, 1)
+                    .expand(attn_scores.shape[0], -1, attn_scores.shape[-2], -1)
+                    .to(attn_scores.dtype)
+                )
+                combined = torch.cat([attn_scores, sink_col], dim=-1)
+                combined = combined - combined.max(dim=-1, keepdim=True).values
+                attn_weights = torch.nn.functional.softmax(
+                    combined, dim=-1, dtype=torch.float32
+                ).to(query_states.dtype)[..., :-1]
+            else:
+                attn_weights = self._masked_softmax(attn_scores, dtype=torch.float32).to(
+                    query_states.dtype
+                )
+            attn_weights = self._scrub_compatibility_pattern_nans(attn_weights)
+
+            # --- Dropout ---
+            dropout_rate = getattr(hf_attn, "attention_dropout", 0.0)
+            if self.training and dropout_rate > 0.0:
+                attn_weights = torch.nn.functional.dropout(
+                    attn_weights, p=dropout_rate, training=True
+                )
+
+            # --- hook_pattern: POST-softmax ---
+            attn_weights = self.hook_pattern(attn_weights)
+
+            # --- Attention Output ---
+            attn_output = torch.matmul(attn_weights, value_states_expanded)
+            attn_output = attn_output.transpose(1, 2).contiguous()
+            attn_output = attn_output.reshape(*input_shape, -1)
 
         # --- Gated attention (Qwen3.5/Qwen3Next) ---
         if q_gate is not None:
