@@ -386,6 +386,9 @@ class HookPoint(nn.Module):
         self.hook_conversion = hook_conversion
 
     def forward(self, x: Tensor) -> Tensor:
+        # Makes torch.compile guard on the hook list (it skips guards on empty nn.Module
+        # hook dicts), so adding a hook after compiling recompiles instead of being ignored.
+        len(self.fwd_hooks)
         return x
 
     def layer(self):

@@ -44,6 +44,9 @@ class LinearBridge(GeneralizedComponent):
         output = self.original_component(input, *args, **kwargs)
         output = self.hook_out(output)
         object.__setattr__(self, "_fired_hook_out", True)
+        capture = self.__dict__.get("_capture_output_into")
+        if capture is not None:
+            capture[0][capture[1]] = output
         return output
 
     def __repr__(self) -> str:

@@ -705,6 +705,9 @@ class TransformerBridge(BridgeCore, HookIntrospectionMixin, nn.Module):
             self._initialize_hook_registry()
             self._setup_hook_compatibility()
             self._register_all_aliases_recursive()
+            for block in getattr(self, "blocks", []):
+                if hasattr(block, "_maybe_wire_capture_hooks"):
+                    block._maybe_wire_capture_hooks()
 
     def _setup_hook_compatibility(self) -> None:
         """Setup hook compatibility transformations to match HookedTransformer behavior.

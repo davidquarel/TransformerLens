@@ -112,7 +112,8 @@ class MLPBridge(GeneralizedComponent):
             )
         hidden_states = args[0]
         hidden_states = self.hook_in(hidden_states)
-        in_module = getattr(self, "in", None) or getattr(self, "input", None)
+        # _modules lookup: dynamo's guard codegen chokes on getattr(self, "in").
+        in_module: Any = self._modules.get("in") or self._modules.get("input")
         if in_module is not None and not hasattr(in_module, "hook_in"):
             in_module = None
         if in_module is not None:
