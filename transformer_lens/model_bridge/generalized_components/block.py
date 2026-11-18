@@ -4,9 +4,9 @@ This module contains the bridge component for transformer blocks.
 """
 from __future__ import annotations
 
+import functools
 import inspect
-import weakref
-from typing import Any, Callable, Dict, Optional, cast
+from typing import Any, Callable, Dict, Optional
 
 import torch
 
@@ -170,13 +170,7 @@ class BlockBridge(GeneralizedComponent):
             and getattr(attn, "supports_split_qkv_fork", False)
             and getattr(ln1, "original_component", None) is not None
         ):
-            attn_ref = cast(AttentionBridge, weakref.proxy(attn))
-
-            def _capture_pre_ln1(_module: torch.nn.Module, args: tuple) -> None:
-                if args and isinstance(args[0], torch.Tensor):
-                    attn_ref._captured_pre_ln_residual = args[0]
-
-            handle = ln1.register_forward_pre_hook(_capture_pre_ln1)
+            handle = ln1.register_forward_pre_hook(self._capture_pre_ln1)
             self._capture_hook_handles.append(handle)
 
         # hook_mlp_in must capture the MLP-branch entry point: ln2's input on
@@ -190,21 +184,20 @@ class BlockBridge(GeneralizedComponent):
             capture_target is not None
             and getattr(capture_target, "original_component", None) is not None
         ):
-            hook_mlp_in = self.hook_mlp_in
-            block_ref = weakref.proxy(self)
-
-            def _capture_mlp_in(_module: torch.nn.Module, args: tuple) -> Any:
-                if not block_ref._read_use_hook_mlp_in():
-                    return None
-                if args and isinstance(args[0], torch.Tensor):
-                    hooked = hook_mlp_in(args[0])
-                    return (hooked,) + args[1:]
-                return None
-
-            handle = capture_target.register_forward_pre_hook(_capture_mlp_in)
+            handle = capture_target.register_forward_pre_hook(self._capture_mlp_in)
             self._capture_hook_handles.append(handle)
 
         self._capture_hooks_wired = True
+
+    # Bound-method hooks (not closures): torch.compile traces them, and deepcopy rebinds them.
+    def _capture_pre_ln1(self, _module: torch.nn.Module, args: tuple) -> None:
+        if args and isinstance(args[0], torch.Tensor):
+            self.attn._captured_pre_ln_residual = args[0]
+
+    def _capture_mlp_in(self, _module: torch.nn.Module, args: tuple) -> Any:
+        if self._read_use_hook_mlp_in() and args and isinstance(args[0], torch.Tensor):
+            return (self.hook_mlp_in(args[0]),) + args[1:]
+        return None
 
     def _teardown_capture_hooks(self) -> None:
         """Remove the capture hooks installed by _maybe_wire_capture_hooks (and subclass extensions)."""
@@ -582,28 +575,26 @@ class ScaledResidualBlockBridge(BlockBridge):
                 or getattr(sub, "original_component", None) is None
             ):
                 continue
-            handle = sub.register_forward_hook(self._make_scaled_contribution_hook(hook_point))
+            handle = sub.register_forward_hook(
+                functools.partial(self._scaled_contribution_hook, hook_name)
+            )
             self._capture_hook_handles.append(handle)
 
-    def _make_scaled_contribution_hook(
-        self, hook_point: HookPoint
-    ) -> Callable[[torch.nn.Module, tuple, Any], Any]:
-        """Build a forward hook exposing ``output * scale`` through hook_point."""
-        scale = self.residual_contribution_scale
-
-        def _hook(_module: torch.nn.Module, _args: tuple, output: Any) -> Any:
-            if not hook_point.has_hooks(dir="both"):
-                return None
-            is_tuple = isinstance(output, tuple)
-            out = output[0] if is_tuple else output
-            if not isinstance(out, torch.Tensor):
-                return None
-            new = self._hook_scaled_output(out, hook_point, scale)
-            if new is out:
-                return None
-            return ((new,) + output[1:]) if is_tuple else new
-
-        return _hook
+    def _scaled_contribution_hook(
+        self, hook_name: str, _module: torch.nn.Module, _args: tuple, output: Any
+    ) -> Any:
+        """Forward hook exposing ``output * scale`` through ``self.<hook_name>``."""
+        hook_point = getattr(self, hook_name)
+        if not hook_point.has_hooks(dir="both"):
+            return None
+        is_tuple = isinstance(output, tuple)
+        out = output[0] if is_tuple else output
+        if not isinstance(out, torch.Tensor):
+            return None
+        new = self._hook_scaled_output(out, hook_point, self.residual_contribution_scale)
+        if new is out:
+            return None
+        return ((new,) + output[1:]) if is_tuple else new
 
 
 class DelegatedAttentionBlockBridge(BlockBridge):

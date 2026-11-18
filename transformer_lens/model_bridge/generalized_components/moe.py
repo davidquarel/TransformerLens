@@ -689,6 +689,8 @@ class MoERouterBridge(LinearBridge):
             if (
                 indices is not None
                 and expanded.shape != parts[weights_at].shape
+                # Identity check first: skips the data-dependent compare (a graph break) when unhooked.
+                and expanded is not scattered
                 and not torch.equal(expanded, scattered)
             ):
                 # An edit outside the current top-k would otherwise be discarded

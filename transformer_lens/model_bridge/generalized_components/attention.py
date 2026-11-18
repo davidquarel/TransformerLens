@@ -870,18 +870,22 @@ class AttentionBridge(GeneralizedComponent):
         reroute_position_bias = self.requires_relative_position_bias
         caller_output_attentions = bool(kwargs.get("output_attentions", False))
         qk_capture: Dict[str, torch.Tensor] = {}
-        capture_handles: list = []
+        qk_projs = [self._modules.get(k) for k in ("q", "k")] if reroute_position_bias else []
         if reroute_position_bias:
             kwargs["output_attentions"] = True
-            capture_handles = self._capture_qk_outputs(qk_capture)
+            # The projections record their outputs here (no per-call hook registration, which breaks torch.compile).
+            for key, proj in zip(("q", "k"), qk_projs):
+                if proj is not None:
+                    object.__setattr__(proj, "_capture_output_into", (qk_capture, key))
         # try/finally so the captured tensor (and its autograd graph) is
         # released even if original_component raises.
         try:
             output = self.original_component(*args, **kwargs)
         finally:
             self._captured_pre_ln_residual = None
-            for handle in capture_handles:
-                handle.remove()
+            for proj in qk_projs:
+                if proj is not None:
+                    object.__setattr__(proj, "_capture_output_into", None)
         if isinstance(output, tuple) and len(output) >= 2:
             # output[0] is attention output
             # output[1] may be attention weights (pattern) or position_bias (T5)
@@ -911,29 +915,6 @@ class AttentionBridge(GeneralizedComponent):
         else:
             output = self.hook_out(output)
         return output
-
-    def _capture_qk_outputs(self, store: Dict[str, torch.Tensor]) -> list:
-        """Capture the Q/K projection outputs during the wrapped module's forward.
-
-        The relative-position-bias path rebuilds pre-softmax scores from these
-        (the wrapped module exposes neither the scores nor a seam to hook them).
-        Returns the handles; the caller removes them after the forward.
-        """
-        handles = []
-        for key in ("q", "k"):
-            proj = self._modules.get(key)
-            if proj is None:
-                continue
-
-            def make_capture(name: str):
-                def capture(module: Any, inputs: Any, out: Any) -> None:
-                    if isinstance(out, torch.Tensor):
-                        store[name] = out
-
-                return capture
-
-            handles.append(proj.register_forward_hook(make_capture(key)))
-        return handles
 
     def _fire_position_bias_module_hooks(
         self,

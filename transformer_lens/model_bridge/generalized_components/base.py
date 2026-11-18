@@ -472,12 +472,12 @@ class GeneralizedComponent(nn.Module):
         return output
 
     def __getattr__(self, name: str) -> Any:
-        modules = object.__getattribute__(self, "__dict__").get("_modules")
+        modules = self.__dict__.get("_modules")
         if modules is not None and name in modules:
             return modules[name]
         if name == "original_component":
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
-        submodules = object.__getattribute__(self, "__dict__").get("submodules")
+        submodules = self.__dict__.get("submodules")
         if submodules is not None and name in submodules:
             # Don't return submodule here - it should be accessed via _modules after add_module()
             # Raising AttributeError allows PyTorch's add_module() to work correctly
