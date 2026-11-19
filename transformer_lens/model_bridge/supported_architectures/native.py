@@ -3,6 +3,7 @@
 Component mapping adapts to cfg: gated MLP → ``GatedMLPBridge``, RMS norm →
 ``RMSNormalizationBridge``, param-free pre-norm (LNPre / RMSPre) → the
 ``*PreBridge`` pair, rotary drops ``pos_embed``, ``attn_only`` drops MLP.
+Shortformer keeps ``pos_embed`` (its output feeds each block's query/key inputs).
 """
 
 from typing import Any
@@ -45,6 +46,10 @@ def _uses_no_norm(cfg: Any) -> bool:
 
 def _is_rotary(cfg: Any) -> bool:
     return (getattr(cfg, "positional_embedding_type", None) or "standard").lower() == "rotary"
+
+
+def _is_shortformer(cfg: Any) -> bool:
+    return (getattr(cfg, "positional_embedding_type", None) or "standard").lower() == "shortformer"
 
 
 def _make_norm_bridge(name: str, cfg: Any, *, force_rms: bool = False):
@@ -119,8 +124,14 @@ class NativeArchitectureAdapter(ArchitectureAdapter):
     def __init__(self, cfg: Any) -> None:
         super().__init__(cfg)
 
-        self.supports_fold_ln = True
-        self.supports_center_writing_weights = True
+        # Shortformer adds W_pos to the query/key inputs *after* ln1, so those
+        # inputs are neither mean-centered nor unit-scaled the way ln1's output
+        # is. Folding ln1 into W_Q/W_K (centering their read direction, absorbing
+        # a learned scale) and centering W_pos both assume they are, and would
+        # change the model. With no norm there is nothing to fold.
+        shortformer = _is_shortformer(cfg)
+        self.supports_fold_ln = not shortformer or _uses_no_norm(cfg)
+        self.supports_center_writing_weights = not shortformer
         # Native Q/K/V/O are nn.Linear [out, in]; the fold_layer_norm formulas
         # index [head, d_model, d_head]. Without these rearranges folding either
         # raises inside einops or silently mis-places the scale.
