@@ -2,7 +2,8 @@
 
 import pytest
 import torch
-from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM, StaticCache
+from transformers.models.qwen2 import modeling_qwen2
 
 from transformer_lens.model_bridge import TransformerBridge
 
@@ -125,6 +126,23 @@ def test_sdpa_cached_generation_matches_hf_sdpa(kind):
     )
 
     assert torch.equal(out, expected)
+
+
+@pytest.mark.parametrize("hook_pattern", [False, True], ids=["sdpa", "eager-fallback"])
+def test_sdpa_none_mask_over_padded_static_keys_matches_hf_sdpa(hook_pattern, monkeypatch):
+    # For a static cache's prompt HF can pass no mask and rely on SDPA's top-left causal alignment
+    # over the padded (still empty) keys. Reproduce that mask for both models.
+    monkeypatch.setattr(modeling_qwen2, "create_causal_mask", lambda *args, **kwargs: None)
+    bridge = _bridge("qwen2", attn_implementation="sdpa")
+    if hook_pattern:
+        bridge.add_hook("blocks.0.attn.hook_pattern", lambda pattern, hook: None)
+    tokens = _inputs()[0][:1]
+
+    def logits(model):
+        cache = StaticCache(config=model.config, max_cache_len=tokens.shape[1] + 4)
+        return model(tokens, past_key_values=cache, use_cache=True).logits
+
+    torch.testing.assert_close(logits(bridge.original_model), logits(_tiny("qwen2", "sdpa")))
 
 
 def test_unknown_attn_implementation_raises():

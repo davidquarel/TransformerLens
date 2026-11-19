@@ -535,11 +535,13 @@ class PositionEmbeddingsAttentionBridge(PositionEmbeddingHooksMixin, AttentionBr
         key_states, value_states = self._update_kv_cache(key_states, value_states, **kwargs)
 
         q_len, kv_len = query_states.shape[-2], key_states.shape[-2]
-        # Softcap and sinks have no SDPA kernel; a None mask must be plain causal or decode.
+        # Softcap and sinks have no SDPA kernel. A None mask from an SDPA-loaded HF model means SDPA's
+        # top-left-aligned causal mask (e.g. a static cache's padded keys), so it goes to SDPA as is.
+        hf_sdpa = getattr(getattr(hf_attn, "config", None), "_attn_implementation", None) == "sdpa"
         if (
             getattr(hf_attn, "attn_logit_softcapping", None) is None
             and getattr(hf_attn, "sinks", None) is None
-            and (attention_mask.ndim == 4 if attention_mask is not None else q_len in (1, kv_len))
+            and (attention_mask is None or attention_mask.ndim == 4)
             and self._use_sdpa()
         ):
             from transformers.integrations.sdpa_attention import sdpa_attention_forward
@@ -556,6 +558,11 @@ class PositionEmbeddingsAttentionBridge(PositionEmbeddingHooksMixin, AttentionBr
             )
             attn_output = attn_output.reshape(*input_shape, -1)
         else:
+            if hf_sdpa and attention_mask is None and q_len > 1:
+                # Make SDPA's implicit top-left causal mask explicit for the eager path.
+                attention_mask = torch.ones(
+                    q_len, kv_len, dtype=torch.bool, device=query_states.device
+                ).tril()[None, None]
             # --- GQA: Expand K/V ---
             num_key_value_groups = getattr(hf_attn, "num_key_value_groups", 1)
             if num_key_value_groups > 1:
