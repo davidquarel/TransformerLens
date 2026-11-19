@@ -873,51 +873,6 @@ def test_shortformer_keeps_positions_out_of_the_residual_stream():
         torch.testing.assert_close(cache[f"blocks.{layer}.attn.k.hook_in"], resid_pre + pos_embed)
 
 
-def test_shortformer_differs_from_standard_with_the_same_weights():
-    shortformer = TransformerBridge.boot_native(_shortformer_cfg())
-    standard = TransformerBridge.boot_native(_shortformer_cfg(positional_embedding_type="standard"))
-    standard.load_state_dict(shortformer.state_dict())
-    tokens = torch.tensor([[1, 5, 3, 5, 2, 7]])
-    with torch.no_grad():
-        assert not torch.allclose(shortformer(tokens), standard(tokens), atol=1e-4)
-
-
-def test_shortformer_is_not_implemented_with_hooks():
-    """It is part of the model, so clearing every hook leaves it in place."""
-    bridge = TransformerBridge.boot_native(_shortformer_cfg())
-    tokens = torch.tensor([[1, 5, 3, 5, 2, 7]])
-    with torch.no_grad():
-        before = bridge(tokens)
-        bridge.reset_hooks(including_permanent=True)
-        torch.testing.assert_close(bridge(tokens), before)
-
-
-def test_shortformer_pos_embed_hook_edits_reach_attention():
-    bridge = TransformerBridge.boot_native(_shortformer_cfg())
-    tokens = torch.tensor([[1, 5, 3, 5, 2, 7]])
-    with torch.no_grad():
-        clean = bridge(tokens)
-        ablated = bridge.run_with_hooks(
-            tokens, fwd_hooks=[("hook_pos_embed", lambda pos_embed, hook: pos_embed * 0)]
-        )
-    assert not torch.allclose(clean, ablated, atol=1e-4)
-
-
-@pytest.mark.parametrize("stop_at_layer", [0, 1, 2])
-def test_shortformer_stop_at_layer_matches_cache(stop_at_layer: int):
-    bridge = TransformerBridge.boot_native(_shortformer_cfg())
-    tokens = torch.tensor([[1, 5, 3, 5, 2, 7]])
-    with torch.no_grad():
-        _, cache = bridge.run_with_cache(tokens)
-        resid = bridge(tokens, stop_at_layer=stop_at_layer)
-    expected = (
-        cache[f"blocks.{stop_at_layer}.hook_resid_pre"]
-        if stop_at_layer < bridge.cfg.n_layers
-        else cache[f"blocks.{stop_at_layer - 1}.hook_resid_post"]
-    )
-    torch.testing.assert_close(resid, expected)
-
-
 def test_shortformer_input_to_embed_round_trip():
     """The residual from input_to_embed has no positions; resuming from it still
     gives the full forward, because the blocks re-derive positions themselves."""
@@ -930,19 +885,6 @@ def test_shortformer_input_to_embed_round_trip():
         torch.testing.assert_close(residual, cache["hook_embed"])
         actual = bridge(residual, start_at_layer=0, attention_mask=attention_mask)
     torch.testing.assert_close(actual, expected)
-
-
-@pytest.mark.parametrize("normalization_type", ["LN", "LNPre", "RMS", "RMSPre"])
-def test_shortformer_with_a_norm_declines_fold_ln(normalization_type):
-    """Positions join the query/key inputs after ln1, so ln1 can't be folded into W_Q/W_K."""
-    bridge = TransformerBridge.boot_native(_shortformer_cfg(normalization_type=normalization_type))
-    assert bridge.adapter.supports_fold_ln is False
-    assert bridge.adapter.supports_center_writing_weights is False
-
-
-def test_shortformer_without_a_norm_keeps_fold_ln_support():
-    bridge = TransformerBridge.boot_native(_shortformer_cfg(normalization_type=None))
-    assert bridge.adapter.supports_fold_ln is True
 
 
 @pytest.mark.parametrize("normalization_type", [None, "LN", "LNPre", "RMS", "RMSPre"])

@@ -313,8 +313,7 @@ class NativeAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch, seq, _ = hidden_states.shape
 
-        # Shortformer: positions reach queries and keys only, never the values
-        # (so never the residual stream).
+        # Shortformer: positions feed queries and keys only, never the values.
         qk_input = hidden_states
         if shortformer_pos_embed is not None:
             qk_input = hidden_states + shortformer_pos_embed
@@ -552,8 +551,7 @@ class NativeModel(nn.Module):
                 torch.arange(seq, device=model_input.device).unsqueeze(0).expand(batch, -1)
             )
 
-        # Shortformer keeps positions out of the residual stream: each block
-        # adds them to its attention's query and key inputs instead.
+        # Shortformer: positions skip the residual stream and go to each block's q/k.
         shortformer_pos_embed: Optional[torch.Tensor] = None
         if self.pos is not None:
             pos_embed = self.pos(position_ids)

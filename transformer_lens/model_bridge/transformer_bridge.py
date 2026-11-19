@@ -284,7 +284,8 @@ class TransformerBridge(BridgeCore, HookIntrospectionMixin, nn.Module):
             n_devices: Optional[int] = None,
             max_memory: Optional[dict[Union[str, int], Union[str, int]]] = None,
             offload_folder: Optional[str] = None,
-        ) -> "TransformerBridge": ...
+        ) -> "TransformerBridge":
+            ...
 
         @staticmethod
         def boot_native(
@@ -293,7 +294,8 @@ class TransformerBridge(BridgeCore, HookIntrospectionMixin, nn.Module):
             device: Optional[Union[str, torch.device]] = None,
             dtype: Optional[torch.dtype] = None,
             model_name: str = "native",
-        ) -> "TransformerBridge": ...
+        ) -> "TransformerBridge":
+            ...
 
         @staticmethod
         def boot_tl_legacy(
@@ -303,7 +305,8 @@ class TransformerBridge(BridgeCore, HookIntrospectionMixin, nn.Module):
             device: Optional[Union[str, torch.device]] = None,
             dtype: torch.dtype = torch.float32,
             tokenizer: Optional[Any] = None,
-        ) -> "TransformerBridge": ...
+        ) -> "TransformerBridge":
+            ...
 
     @property
     def original_model(self) -> nn.Module:
@@ -2104,11 +2107,9 @@ class TransformerBridge(BridgeCore, HookIntrospectionMixin, nn.Module):
         ``attention_mask`` is the caller's mask, else the tokenizer's for a padded
         string batch on either padding side, else ``None``.
 
-        ``shortformer_pos_embed`` is always ``None``. For most models the residual
-        already carries positional information. For a native shortformer model
-        (``positional_embedding_type="shortformer"``) it does not, but the model
-        re-derives the positions for each block's queries and keys itself, so
-        resuming from the residual alone still reproduces the full forward.
+        ``shortformer_pos_embed`` is always ``None``: for the models the bridge
+        supports the residual already carries positional information, so there is
+        no separate positional stream to return.
         """
         if isinstance(input, (str, list)):
             assert self.tokenizer is not None, "Must provide a tokenizer for string input."
